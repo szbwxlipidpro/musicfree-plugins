@@ -2,7 +2,7 @@
   "plugins": [
     {
       "name": "网易云",
-     "url": "https://raw.githubusercontent.com/szbwxlipidpro/musicfree-plugins/main/网易云_Android.js"，
+     "url": "https://raw.githubusercontent.com/szbwxlipidpro/musicfree-plugins/main/网易云_Android.js",
       "version": "2.3.0"
     }
   ]
