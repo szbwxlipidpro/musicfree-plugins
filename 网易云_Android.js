@@ -1,6 +1,6 @@
 /**
  * MusicFree 安卓插件：网易云
- * 版本：2.3.0
+ * 版本：2.3.1
  *
  * 专为 MusicFree Android 调整：
  * - 避免高版本可选链、空值合并、对象展开、异步箭头函数等安卓 JS 引擎容易出问题的语法；
@@ -16,8 +16,9 @@ var CryptoJS = require("crypto-js");
 var qs = require("qs");
 
 var PLATFORM = "网易云";
-var VERSION = "2.3.0";
+var VERSION = "2.3.1";
 var PAGE_SIZE = 30;
+var SONG_DETAIL_BATCH_SIZE = 200;
 
 var WEB_BASE = "https://music.163.com";
 var API_BASE = "https://interface.music.163.com";
@@ -434,33 +435,224 @@ async function getTopLists() {
 }
 
 async function getPlaylistDetailById(id) {
-  var res = await officialRequest(
-    {
-      method: "GET",
-      url: WEB_BASE + "/api/v3/playlist/detail",
-      params: {
-        id: id,
-        n: 5000,
-        s: 8
-      }
-    },
-    true
-  );
+  var res;
 
-  if (res.data && res.data.playlist) {
-    return res.data.playlist;
-  }
+  /*
+   * 当前网易云歌单详情实现使用 v6，并把 n 设为较大值。
+   * Android 端优先走官方 API 域名的 POST；若接口临时变化，
+   * 再回退到旧的 Web v3 请求，避免整个歌单功能失效。
+   */
+  try {
+    res = await officialRequest(
+      {
+        method: "POST",
+        url: API_BASE + "/api/v6/playlist/detail",
+        data: qs.stringify({
+          id: id,
+          n: 100000,
+          s: 8
+        }),
+        headers: {
+          "Content-Type":
+            "application/x-www-form-urlencoded;charset=UTF-8"
+        }
+      },
+      true
+    );
 
-  if (res.data && res.data.result) {
-    return res.data.result;
-  }
+    if (res.data && res.data.playlist) {
+      return res.data.playlist;
+    }
+
+    if (res.data && res.data.result) {
+      return res.data.result;
+    }
+  } catch (e1) {}
+
+  try {
+    res = await officialRequest(
+      {
+        method: "GET",
+        url: WEB_BASE + "/api/v3/playlist/detail",
+        params: {
+          id: id,
+          n: 100000,
+          s: 8
+        }
+      },
+      true
+    );
+
+    if (res.data && res.data.playlist) {
+      return res.data.playlist;
+    }
+
+    if (res.data && res.data.result) {
+      return res.data.result;
+    }
+  } catch (e2) {}
 
   return {};
 }
 
+function getTrackIdValue(trackId) {
+  if (trackId === undefined || trackId === null) {
+    return "";
+  }
+
+  if (typeof trackId === "object" && trackId.id !== undefined) {
+    return asString(trackId.id);
+  }
+
+  return asString(trackId);
+}
+
+async function fetchSongDetailsByIds(ids) {
+  var requestIds = [];
+  var i;
+  var id;
+  var c = [];
+  var res;
+  var songs;
+
+  ids = ids || [];
+
+  for (i = 0; i < ids.length; i += 1) {
+    id = asString(ids[i]);
+    if (id) {
+      requestIds.push(id);
+      c.push({ id: Number(id) || id });
+    }
+  }
+
+  if (!requestIds.length) {
+    return [];
+  }
+
+  /*
+   * 先复用本插件已经用于单曲详情的公开 song/detail 接口。
+   * 一次传入一批 ids，避免逐首请求造成 Android 端严重超时。
+   */
+  try {
+    res = await officialRequest(
+      {
+        method: "GET",
+        url: WEB_BASE + "/api/song/detail",
+        params: {
+          ids: "[" + requestIds.join(",") + "]"
+        }
+      },
+      true
+    );
+
+    songs = res.data && res.data.songs ? res.data.songs : [];
+    if (songs.length) {
+      return songs;
+    }
+  } catch (e1) {}
+
+  /*
+   * 兼容回退到 v3 批量详情。若服务端不接受明文 v3 请求，
+   * 调用方会继续保留歌单详情接口直接返回的 tracks。
+   */
+  try {
+    res = await officialRequest(
+      {
+        method: "POST",
+        url: WEB_BASE + "/api/v3/song/detail",
+        data: qs.stringify({
+          c: JSON.stringify(c)
+        }),
+        headers: {
+          "Content-Type":
+            "application/x-www-form-urlencoded;charset=UTF-8"
+        }
+      },
+      true
+    );
+
+    return res.data && res.data.songs ? res.data.songs : [];
+  } catch (e2) {
+    return [];
+  }
+}
+
+async function getCompletePlaylistTracks(playlist) {
+  var directTracks = playlist && playlist.tracks ? playlist.tracks : [];
+  var trackIds = playlist && playlist.trackIds ? playlist.trackIds : [];
+  var byId = {};
+  var orderedIds = [];
+  var missingIds = [];
+  var result = [];
+  var i;
+  var id;
+  var song;
+  var start;
+  var batch;
+  var rows;
+  var j;
+
+  /* 没有 trackIds 时，只能使用接口直接返回的 tracks。 */
+  if (!trackIds.length) {
+    return directTracks;
+  }
+
+  for (i = 0; i < directTracks.length; i += 1) {
+    song = directTracks[i];
+    if (song && song.id !== undefined && song.id !== null) {
+      byId[asString(song.id)] = song;
+    }
+  }
+
+  for (i = 0; i < trackIds.length; i += 1) {
+    id = getTrackIdValue(trackIds[i]);
+    if (!id) {
+      continue;
+    }
+
+    orderedIds.push(id);
+    if (!byId[id]) {
+      missingIds.push(id);
+    }
+  }
+
+  /*
+   * 网易云现代歌曲详情接口单次上限为 1000 首；Android 端这里保守按 200 首分批。
+   * 对大歌单分批补齐缺失曲目；某一批失败时保留已拿到的曲目，
+   * 不让整个歌单因为一批网络失败而完全打不开。
+   */
+  for (start = 0; start < missingIds.length; start += SONG_DETAIL_BATCH_SIZE) {
+    batch = missingIds.slice(start, start + SONG_DETAIL_BATCH_SIZE);
+
+    try {
+      rows = await fetchSongDetailsByIds(batch);
+      for (j = 0; j < rows.length; j += 1) {
+        song = rows[j];
+        if (song && song.id !== undefined && song.id !== null) {
+          byId[asString(song.id)] = song;
+        }
+      }
+    } catch (e) {}
+  }
+
+  /* 必须按 trackIds 重排，避免批量详情接口改变原歌单顺序。 */
+  for (i = 0; i < orderedIds.length; i += 1) {
+    song = byId[orderedIds[i]];
+    if (song) {
+      result.push(song);
+    }
+  }
+
+  /*
+   * 极端情况下 trackIds 存在但详情全部失败，则回退 directTracks，
+   * 至少保留接口直接给出的前几首，而不是返回空歌单。
+   */
+  return result.length ? result : directTracks;
+}
+
 async function getTopListDetail(topListItem) {
   var playlist = await getPlaylistDetailById(topListItem.id);
-  var tracks = playlist.tracks || [];
+  var tracks = await getCompletePlaylistTracks(playlist);
 
   return {
     isEnd: true,
@@ -552,7 +744,7 @@ async function getRecommendSheetsByTag(tag, page) {
 
 async function getMusicSheetInfo(sheetItem) {
   var playlist = await getPlaylistDetailById(sheetItem.id);
-  var tracks = playlist.tracks || [];
+  var tracks = await getCompletePlaylistTracks(playlist);
   var creator = playlist.creator || {};
 
   return {
@@ -574,7 +766,10 @@ async function getMusicSheetInfo(sheetItem) {
         playlist.playCount || sheetItem.playCount || 0
       ),
       worksNum: Number(
-        playlist.trackCount || tracks.length || 0
+        playlist.trackCount ||
+        (playlist.trackIds ? playlist.trackIds.length : 0) ||
+        tracks.length ||
+        0
       )
     },
     musicList: mapMusicItems(tracks)
@@ -1070,6 +1265,7 @@ module.exports = {
   platform: PLATFORM,
   author: "自定义 MusicFree 插件",
   version: VERSION,
+  srcUrl: "https://raw.githubusercontent.com/szbwxlipidpro/musicfree-plugins/main/网易云_Android.js",
 
   primaryKey: ["id"],
   cacheControl: "no-store",
@@ -1088,7 +1284,7 @@ module.exports = {
       "MUSIC_U / Cookie 属于登录凭证，请只保存在自己的设备。"
     ],
     importMusicSheet: [
-      "排行榜与热门歌单会在刷新时重新请求，无需因榜单更新重新安装插件。"
+      "排行榜与热门歌单会在刷新时重新请求；大歌单会按 trackIds 自动补齐完整曲目。"
     ]
   },
 
